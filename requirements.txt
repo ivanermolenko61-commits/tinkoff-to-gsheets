@@ -1,3 +1,4 @@
+--extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 t-tech-investments>=1.49.3
 requests>=2.34.0
 python-dotenv>=1.0.1
