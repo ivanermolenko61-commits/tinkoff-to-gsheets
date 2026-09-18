@@ -3,7 +3,7 @@ name: Tinkoff Invest Sync
 on:
   # Расписание — каждый день в 06:00 UTC (= 09:00 МСК)
   schedule:
-    - cron: '0 6 * * *'
+  - cron: '*/15 * * * *'
 
   # Возможность запустить вручную из интерфейса GitHub
   workflow_dispatch:
