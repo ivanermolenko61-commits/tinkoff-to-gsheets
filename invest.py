@@ -4,10 +4,11 @@ Tinkoff Invest → Google Sheets
 Собирает позиции, операции и снимок портфеля по всем открытым счетам
 и отправляет их в Apps Script, который раскладывает данные по листам.
 
-Создаваемые листы:
+Листы:
   Positions, Positions_Aggregated, Positions_Shares, Positions_Bonds,
   Positions_ETFs, Positions_Currencies, Positions_Futures, Positions_Other,
-  Positions_Money, Positions_SummaryByType, Operations, YearReport,
+  Positions_Money, Positions_SummaryByType, Operations,
+  Report (отчётная панель),
   PortfolioSnapshots (накапливается, не перезаписывается).
 
 Секреты берутся из:
@@ -28,8 +29,6 @@ from dotenv import load_dotenv
 from t_tech.invest import Client
 from t_tech.invest.utils import quotation_to_decimal
 
-# Загружаем .env, только если файл есть и переменные ещё не установлены
-# (load_dotenv по умолчанию НЕ перезаписывает существующие переменные окружения).
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
     load_dotenv(dotenv_path=env_path, encoding="utf-8-sig")
@@ -48,12 +47,13 @@ if not SECRET:
 OPERATIONS_DAYS = 1095
 REPORT_WINDOW_DAYS = 365
 SNAPSHOT_DAYS_AGO = 365
+SNAPSHOT_MIN_DAYS_AGO = 2
 
 RAW_SHEET = 'Positions'
 AGG_SHEET = 'Positions_Aggregated'
 SUMMARY_BY_TYPE_SHEET = 'Positions_SummaryByType'
 OPERATIONS_SHEET = 'Operations'
-YEAR_REPORT_SHEET = 'YearReport'
+REPORT_SHEET = 'Report'
 SNAPSHOTS_SHEET = 'PortfolioSnapshots'
 
 TYPE_SHEETS = {
@@ -141,6 +141,29 @@ class AppsScriptClient:
             print(f"  ! Ошибка запроса снимка: {e}")
             return None
 
+    def get_oldest_snapshot(self, min_days_ago=2):
+        try:
+            resp = requests.get(
+                self.url,
+                params={
+                    'secret': self.secret,
+                    'action': 'get_oldest_snapshot',
+                    'min_days_ago': min_days_ago,
+                },
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                print(f"  ! HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            if data.get('status') != 'ok':
+                print(f"  ! Ошибка: {data.get('message')}")
+                return None
+            return data.get('snapshot')
+        except Exception as e:
+            print(f"  ! Ошибка запроса снимка: {e}")
+            return None
+
 
 # ----------------------------------------------------------------------------
 # Вспомогательные функции
@@ -200,6 +223,8 @@ def _parse_datetime(s):
 # XIRR
 # ----------------------------------------------------------------------------
 def _xirr(cashflows):
+    """Годовая доходность по потокам. cashflows: список (datetime, amount).
+    Оттоки — с минусом, притоки — с плюсом."""
     if not cashflows or len(cashflows) < 2:
         return None
     cashflows = sorted(cashflows, key=lambda x: x[0])
@@ -230,7 +255,7 @@ def _xirr(cashflows):
 
 
 # ----------------------------------------------------------------------------
-# Агрегация
+# Агрегация (без изменений)
 # ----------------------------------------------------------------------------
 def aggregate_by_key(rows, key_name):
     if not rows or len(rows) <= 1: return rows
@@ -296,7 +321,7 @@ def aggregate_by_key(rows, key_name):
 
 
 # ----------------------------------------------------------------------------
-# Сбор позиций
+# Сбор позиций (без изменений)
 # ----------------------------------------------------------------------------
 def collect_positions(client, accounts):
     header = [
@@ -375,7 +400,7 @@ def collect_positions(client, accounts):
 
 
 # ----------------------------------------------------------------------------
-# Сбор операций
+# Сбор операций (без изменений)
 # ----------------------------------------------------------------------------
 def fetch_operations_chunk(client, account_id, from_dt, to_dt):
     try:
@@ -467,57 +492,38 @@ def build_today_snapshot(raw_positions, today=None):
 
 
 # ----------------------------------------------------------------------------
-# Годовой отчёт
+# Отчётная панель
 # ----------------------------------------------------------------------------
-def build_year_report(operations_rows, raw_positions, snapshot_365, today=None):
+def _fmt_money(v):
+    return round(float(v or 0), 2)
+
+
+def _pct(x, base):
+    if base is None or base == 0:
+        return None
+    return round(x / base * 100, 2)
+
+
+def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
+    """Формирует лист Report — человекочитаемую панель.
+
+    Логика:
+      Вложено (нетто)  = Пополнения − Выводы
+      Результат (руб)  = Портфель сейчас − Вложено (нетто)
+      Структура результата:
+          Дивиденды + Купоны + Комиссии + Налоги + Изменение цены
+      Простая доходность = Результат / Вложено (нетто) * 100
+      Годовая (XIRR)     = по всем потокам капитала (input/output/final)
+    """
     if today is None:
         today = datetime.now(timezone.utc).replace(tzinfo=None)
 
     H_ops = {k: i for i, k in enumerate(operations_rows[0])}
     H_pos = {k: i for i, k in enumerate(raw_positions[0])}
-    period_start = today - timedelta(days=REPORT_WINDOW_DAYS)
 
-    year_dividends = year_coupons = year_fees = year_taxes = 0.0
-    year_inputs = year_outputs = 0.0
-
-    xirr_flows_all = []
-    total_inputs = total_outputs = 0.0
-    total_dividends = total_coupons = total_fees = total_taxes = 0.0
-
-    for r in operations_rows[1:]:
-        op_type = str(r[H_ops['type']] or '')
-        category = categorize_operation(op_type)
-        try:
-            payment = float(r[H_ops['payment_rub']] or 0)
-        except (ValueError, TypeError):
-            payment = 0.0
-        dt = _parse_datetime(r[H_ops['date']])
-        in_period = dt is not None and dt >= period_start
-
-        if category == 'dividend':
-            total_dividends += payment
-            if in_period: year_dividends += payment
-        elif category == 'coupon':
-            total_coupons += payment
-            if in_period: year_coupons += payment
-        elif category == 'fee':
-            total_fees += payment
-            if in_period: year_fees += payment
-        elif category == 'tax':
-            total_taxes += payment
-            if in_period: year_taxes += payment
-        elif category == 'input':
-            total_inputs += payment
-            if in_period: year_inputs += payment
-            if dt is not None and payment > 0:
-                xirr_flows_all.append((dt, -payment))
-        elif category == 'output':
-            total_outputs += abs(payment)
-            if in_period: year_outputs += abs(payment)
-            if dt is not None and payment < 0:
-                xirr_flows_all.append((dt, -payment))
-
-    portfolio_value = money_value = 0.0
+    # --- Портфель сейчас ---
+    portfolio_value = 0.0
+    money_value = 0.0
     for r in raw_positions[1:]:
         ptype = str(r[H_pos['type']] or '').lower()
         v = float(r[H_pos['position_value_rub']] or 0)
@@ -527,25 +533,93 @@ def build_year_report(operations_rows, raw_positions, snapshot_365, today=None):
             portfolio_value += v
     total_value = portfolio_value + money_value
 
-    xirr_all_time = _xirr(xirr_flows_all + [(today, total_value)]) if xirr_flows_all else None
+    # --- Все потоки и доходы за всё время ---
+    total_inputs = 0.0
+    total_outputs = 0.0
+    total_dividends = 0.0
+    total_coupons = 0.0
+    total_fees = 0.0          # знак отрицательный, как в операциях
+    total_taxes = 0.0         # знак отрицательный
+    xirr_flows_all = []
+    first_op_date = None
+    last_op_date = None
 
-    start_value = None
-    start_date_str = None
-    actual_days = None
-    simple_period_pct = None
-    simple_period_rub = None
-    xirr_period = None
+    for r in operations_rows[1:]:
+        op_type = str(r[H_ops['type']] or '')
+        category = categorize_operation(op_type)
+        try:
+            payment = float(r[H_ops['payment_rub']] or 0)
+        except (ValueError, TypeError):
+            payment = 0.0
+        dt = _parse_datetime(r[H_ops['date']])
+        if dt is not None:
+            if first_op_date is None or dt < first_op_date: first_op_date = dt
+            if last_op_date is None or dt > last_op_date: last_op_date = dt
 
-    if snapshot_365 and snapshot_365.get('date'):
-        start_dt = _parse_datetime(snapshot_365['date'])
+        if category == 'input' and payment > 0:
+            total_inputs += payment
+            if dt is not None:
+                xirr_flows_all.append((dt, -payment))
+        elif category == 'output' and payment < 0:
+            total_outputs += abs(payment)
+            if dt is not None:
+                xirr_flows_all.append((dt, abs(payment)))
+        elif category == 'dividend':
+            total_dividends += payment
+        elif category == 'coupon':
+            total_coupons += payment
+        elif category == 'fee':
+            total_fees += payment
+        elif category == 'tax':
+            total_taxes += payment
+
+    net_invested = total_inputs - total_outputs
+    result_rub = total_value - net_invested
+    # Изменение цены = всё, что не объяснено доходами и расходами
+    price_change = result_rub - total_dividends - total_coupons - total_fees - total_taxes
+
+    # XIRR за всё время
+    xirr_all = None
+    if xirr_flows_all:
+        xirr_flows_all.append((today, total_value))
+        xirr_all = _xirr(xirr_flows_all)
+
+    simple_all_pct = _pct(result_rub, net_invested) if net_invested > 0 else None
+    portfolio_age_days = (today - first_op_date).days if first_op_date else None
+
+    # --- Период от снимка ---
+    period_days = None
+    period_start_str = None
+    period_simple_pct = None
+    period_xirr = None
+    period_result_rub = None
+    period_inputs = 0.0
+    period_outputs = 0.0
+
+    if snapshot_ref and snapshot_ref.get('date'):
+        start_dt = _parse_datetime(snapshot_ref['date'])
         if start_dt:
-            start_value = float(snapshot_365.get('total_value') or 0)
-            start_date_str = snapshot_365['date']
-            actual_days = (today - start_dt).days
+            start_value = float(snapshot_ref.get('total_value') or 0)
+            period_days = (today - start_dt).days
+            period_start_str = snapshot_ref['date']
 
-            simple_period_rub = total_value - start_value - year_inputs + year_outputs
-            if start_value > 0:
-                simple_period_pct = simple_period_rub / start_value * 100
+            for r in operations_rows[1:]:
+                op_type = str(r[H_ops['type']] or '')
+                category = categorize_operation(op_type)
+                try:
+                    payment = float(r[H_ops['payment_rub']] or 0)
+                except (ValueError, TypeError):
+                    payment = 0.0
+                dt = _parse_datetime(r[H_ops['date']])
+                if dt is None or dt < start_dt:
+                    continue
+                if category == 'input' and payment > 0:
+                    period_inputs += payment
+                elif category == 'output' and payment < 0:
+                    period_outputs += abs(payment)
+
+            period_result_rub = total_value - start_value - period_inputs + period_outputs
+            period_simple_pct = _pct(period_result_rub, start_value) if start_value > 0 else None
 
             period_flows = [(start_dt, -start_value)]
             for r in operations_rows[1:]:
@@ -556,104 +630,93 @@ def build_year_report(operations_rows, raw_positions, snapshot_365, today=None):
                 except (ValueError, TypeError):
                     payment = 0.0
                 dt = _parse_datetime(r[H_ops['date']])
-                if dt is None or dt < start_dt: continue
+                if dt is None or dt < start_dt:
+                    continue
                 if category == 'input' and payment > 0:
                     period_flows.append((dt, -payment))
                 elif category == 'output' and payment < 0:
-                    period_flows.append((dt, -payment))
+                    period_flows.append((dt, abs(payment)))
             period_flows.append((today, total_value))
-            xirr_period = _xirr(period_flows)
+            period_xirr = _xirr(period_flows)
 
-    net_invested = total_inputs - total_outputs
-    result_all_rub = total_value - net_invested
-
-    year_passive = year_dividends + year_coupons + year_fees + year_taxes
-    year_net_flow = year_inputs - year_outputs
-
-    rows = [['Показатель', 'Значение', 'Комментарий']]
-
-    rows.append(['📅 ПЕРИОД', '', ''])
-    rows.append(['С', period_start.strftime('%d.%m.%Y'), f'скользящие {REPORT_WINDOW_DAYS} дней'])
-    rows.append(['По', today.strftime('%d.%m.%Y'), 'сегодня'])
+    # --- Сборка листа ---
+    rows = []
+    rows.append(['📊 ОТЧЁТ ПО ПОРТФЕЛЮ', '', ''])
+    rows.append([f'на {today.strftime("%d.%m.%Y")}', '', ''])
+    if portfolio_age_days is not None:
+        rows.append([f'история операций: {portfolio_age_days} дней', '', ''])
     rows.append(['', '', ''])
 
-    rows.append(['💰 ДОХОДЫ ЗА ПЕРИОД', '', ''])
-    rows.append(['Дивиденды', round(year_dividends, 2), ''])
-    rows.append(['Купоны', round(year_coupons, 2), ''])
-    rows.append(['💸 РАСХОДЫ ЗА ПЕРИОД', '', ''])
-    rows.append(['Комиссии брокера', round(year_fees, 2), ''])
-    rows.append(['Налоги', round(year_taxes, 2), ''])
-    rows.append(['📊 ПАССИВНЫЙ ДОХОД', round(year_passive, 2),
-                 'Дивиденды + купоны − комиссии − налоги'])
+    # --- Портфель сейчас ---
+    rows.append(['💰 ПОРТФЕЛЬ СЕЙЧАС', 'Сумма, ₽', 'Доля'])
+    rows.append(['Бумаги', _fmt_money(portfolio_value),
+                 f'{portfolio_value/total_value*100:.1f}%' if total_value else '—'])
+    rows.append(['Свободные деньги', _fmt_money(money_value),
+                 f'{money_value/total_value*100:.1f}%' if total_value else '—'])
+    rows.append(['ИТОГО', _fmt_money(total_value), '100.0%'])
     rows.append(['', '', ''])
 
-    rows.append(['💵 ДВИЖЕНИЕ ДЕНЕГ ЗА ПЕРИОД', '', ''])
-    rows.append(['Пополнения', round(year_inputs, 2), ''])
-    rows.append(['Выводы', round(year_outputs, 2), ''])
-    rows.append(['Нетто-поток', round(year_net_flow, 2), 'Пополнения − выводы'])
+    # --- Вложения ---
+    rows.append(['💵 ВЛОЖЕНИЯ ЗА ВСЁ ВРЕМЯ', 'Сумма, ₽', ''])
+    rows.append(['Пополнения', _fmt_money(total_inputs), ''])
+    rows.append(['Выводы', _fmt_money(total_outputs), ''])
+    rows.append(['Вложено (нетто)', _fmt_money(net_invested), 'Пополнения − выводы'])
     rows.append(['', '', ''])
 
-    rows.append(['📈 ПОРТФЕЛЬ СЕЙЧАС', '', ''])
-    rows.append(['Стоимость бумаг', round(portfolio_value, 2), 'без денег'])
-    rows.append(['Свободные деньги', round(money_value, 2), ''])
-    rows.append(['Всего', round(total_value, 2), 'бумаги + деньги'])
+    # --- Результат ---
+    rows.append(['📈 РЕЗУЛЬТАТ ЗА ВСЁ ВРЕМЯ', 'Сумма, ₽', '% от вложенного'])
+    result_pct = _pct(result_rub, net_invested) if net_invested > 0 else None
+    rows.append(['Портфель − вложено', _fmt_money(result_rub),
+                 f'{result_pct:.2f}%' if result_pct is not None else '—'])
+    rows.append(['', '', ''])
+    rows.append(['  Структура результата:', '', ''])
+
+    def _pct_of_invested(x):
+        p = _pct(x, net_invested) if net_invested > 0 else None
+        return f'{p:.2f}%' if p is not None else '—'
+
+    rows.append(['  ├ Дивиденды', _fmt_money(total_dividends), _pct_of_invested(total_dividends)])
+    rows.append(['  ├ Купоны', _fmt_money(total_coupons), _pct_of_invested(total_coupons)])
+    rows.append(['  ├ Комиссии', _fmt_money(total_fees), _pct_of_invested(total_fees)])
+    rows.append(['  ├ Налоги', _fmt_money(total_taxes), _pct_of_invested(total_taxes)])
+    rows.append(['  └ Изменение цены', _fmt_money(price_change), _pct_of_invested(price_change)])
     rows.append(['', '', ''])
 
-    rows.append([f'📈 РЕЗУЛЬТАТ ЗА {REPORT_WINDOW_DAYS} ДНЕЙ', '', ''])
-    if start_value is not None:
-        rows.append(['Стоимость на начало', round(start_value, 2),
-                     f'снимок от {start_date_str}'])
-        rows.append(['Стоимость сейчас', round(total_value, 2), ''])
-        rows.append(['Пополнения за период', round(year_inputs, 2), ''])
-        rows.append(['Выводы за период', round(year_outputs, 2), ''])
-        rows.append(['Результат за период', round(simple_period_rub, 2),
-                     'Сейчас − Начало − Пополнения + Выводы'])
+    # --- Доходность за всё время ---
+    rows.append(['📉 ДОХОДНОСТЬ ЗА ВСЁ ВРЕМЯ', '%', ''])
+    if simple_all_pct is not None:
+        rows.append(['Простая', f'{simple_all_pct:.2f}%',
+                     f'за {portfolio_age_days} дн.' if portfolio_age_days else ''])
     else:
-        rows.append(['Результат за период', 'н/д',
+        rows.append(['Простая', 'н/д', 'недостаточно данных'])
+    if xirr_all is not None:
+        rows.append(['Годовая (XIRR)', f'{xirr_all:.2f}%', 'с учётом дат потоков'])
+    else:
+        rows.append(['Годовая (XIRR)', 'н/д', 'нужны пополнения и выводы'])
+    rows.append(['', '', ''])
+
+    # --- Доходность за период от снимка ---
+    period_label = period_days if period_days is not None else REPORT_WINDOW_DAYS
+    rows.append([f'📉 ДОХОДНОСТЬ ЗА {period_label} ДНЕЙ (от снимка)', '%', ''])
+    if period_simple_pct is not None:
+        rows.append(['Простая', f'{period_simple_pct:.2f}%',
+                     f'с {period_start_str}'])
+    else:
+        rows.append(['Простая', 'н/д',
                      f'накапливаем снимки (нужно {REPORT_WINDOW_DAYS} дней)'])
-    rows.append(['', '', ''])
-
-    rows.append([f'📋 ИТОГИ ЗА {OPERATIONS_DAYS} ДНЕЙ', '', ''])
-    rows.append(['Внесено всего', round(total_inputs, 2), ''])
-    rows.append(['Выведено всего', round(total_outputs, 2), ''])
-    rows.append(['Вложено (нетто)', round(net_invested, 2), 'Внесено − выведено'])
-    rows.append(['Результат в рублях', round(result_all_rub, 2),
-                 'Портфель сейчас − вложено (нетто)'])
-    rows.append(['   ├ дивиденды', round(total_dividends, 2), ''])
-    rows.append(['   ├ купоны', round(total_coupons, 2), ''])
-    rows.append(['   ├ комиссии', round(total_fees, 2), ''])
-    rows.append(['   ├ налоги', round(total_taxes, 2), ''])
-    rows.append(['   └ изменение цены',
-                 round(result_all_rub - total_dividends - total_coupons - total_fees - total_taxes, 2),
-                 'остаток'])
-    rows.append(['', '', ''])
-
-    rows.append(['📉 ДОХОДНОСТЬ', '', ''])
-    if simple_period_pct is not None and actual_days:
-        rows.append([f'Простая за {actual_days} дней, %',
-                     round(simple_period_pct, 2), f'с {start_date_str}'])
+    if period_xirr is not None:
+        rows.append(['XIRR за период', f'{period_xirr:.2f}%', 'годовая, с учётом дат потоков'])
     else:
-        rows.append([f'Простая за {REPORT_WINDOW_DAYS} дней, %', 'н/д',
-                     'накапливаем снимки'])
-
-    if xirr_period is not None and actual_days:
-        rows.append([f'XIRR за {actual_days} дней, %',
-                     round(xirr_period, 2), 'с учётом дат потоков'])
-    else:
-        rows.append([f'XIRR за {REPORT_WINDOW_DAYS} дней, %', 'н/д',
-                     'накапливаем снимки'])
-
-    if xirr_all_time is not None:
-        rows.append(['XIRR за всё время, %', round(xirr_all_time, 2),
-                     'по всей истории (для справки)'])
+        rows.append(['XIRR за период', 'н/д',
+                     f'накапливаем снимки (нужно {REPORT_WINDOW_DAYS} дней)'])
 
     return rows
 
 
 # ----------------------------------------------------------------------------
-# Все листы
+# Сборка всех листов
 # ----------------------------------------------------------------------------
-def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_365):
+def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref):
     header = raw_data[0]
     H = {k: i for i, k in enumerate(header)}
     sheets = {}
@@ -687,7 +750,7 @@ def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_365):
     sheets[SUMMARY_BY_TYPE_SHEET] = summary
 
     sheets[OPERATIONS_SHEET] = operations_data
-    sheets[YEAR_REPORT_SHEET] = build_year_report(operations_data, raw_data, snapshot_365)
+    sheets[REPORT_SHEET] = build_report(operations_data, raw_data, snapshot_ref)
     sheets[SNAPSHOTS_SHEET] = snapshot_data
 
     return sheets
@@ -725,18 +788,25 @@ def main():
     client_api = AppsScriptClient(APPS_SCRIPT_URL, SECRET)
 
     print(f"\nЧтение снимка портфеля за {SNAPSHOT_DAYS_AGO} дней...")
-    snapshot_365 = client_api.get_snapshot_n_days_ago(SNAPSHOT_DAYS_AGO)
-    if snapshot_365:
-        print(f"  Найден снимок от {snapshot_365['date']}: "
-              f"{snapshot_365['total_value']:,.2f} ₽")
+    snapshot_ref = client_api.get_snapshot_n_days_ago(SNAPSHOT_DAYS_AGO)
+    if snapshot_ref:
+        print(f"  Найден снимок от {snapshot_ref['date']}: "
+              f"{snapshot_ref['total_value']:,.2f} ₽")
     else:
-        print(f"  Снимок не найден — XIRR за скользящий период будет 'н/д'")
+        print(f"  Снимка за {SNAPSHOT_DAYS_AGO} дней нет — беру самый старый "
+              f"(не моложе {SNAPSHOT_MIN_DAYS_AGO} дней)...")
+        snapshot_ref = client_api.get_oldest_snapshot(min_days_ago=SNAPSHOT_MIN_DAYS_AGO)
+        if snapshot_ref:
+            print(f"  Использую снимок от {snapshot_ref['date']}: "
+                  f"{snapshot_ref['total_value']:,.2f} ₽")
+        else:
+            print("  Снимков нужной давности нет — доходность за период будет 'н/д'")
 
     snapshot_data = build_today_snapshot(raw_data)
     print(f"\nСегодняшний снимок: {snapshot_data[1][0]} — {snapshot_data[1][1]:,.2f} ₽")
 
     print("\nПодготовка листов...")
-    sheets = build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_365)
+    sheets = build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref)
 
     print("Отправка в Google Sheets через Apps Script...")
     client_api.write_tables(sheets)
