@@ -1,7 +1,7 @@
 name: Tinkoff Invest Sync
 
 on:
-  # Расписание — каждый день в 06:00 UTC (= 09:00 МСК)
+  # Расписание — каждые 15 минут, чтобы данные были почти всегда актуальными
   schedule:
   - cron: '*/15 * * * *'
 
@@ -21,6 +21,16 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+
+      # Серверы Т-Банка (pip-индекс и API) используют сертификаты УЦ Минцифры,
+      # которых нет в стандартных списках доверенных на раннерах GitHub.
+      # Добавляем их в системное хранилище и указываем pip и gRPC брать его.
+      - name: Trust Russian CA certificates
+        run: |
+          sudo cp certs/*.crt /usr/local/share/ca-certificates/
+          sudo update-ca-certificates
+          echo "PIP_CERT=/etc/ssl/certs/ca-certificates.crt" >> "$GITHUB_ENV"
+          echo "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
