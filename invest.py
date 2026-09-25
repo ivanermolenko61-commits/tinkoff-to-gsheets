@@ -17,6 +17,7 @@ Tinkoff Invest → Google Sheets
   Приоритет у переменных окружения — они НЕ перезаписываются файлом .env.
 """
 
+import bisect
 import os
 import time
 import json as json_module
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from t_tech.invest import Client
+from t_tech.invest import CandleInterval, Client, InstrumentStatus
 from t_tech.invest.utils import quotation_to_decimal
 
 env_path = Path(__file__).parent / ".env"
@@ -188,27 +189,39 @@ def _money_currency(v):
 
 
 class CurrencyRates:
-    """Курсы валют к рублю по последней цене биржевых инструментов.
+    """Курсы валют к рублю: текущие и исторические (на дату операции).
 
-    Нужны, потому что API отдаёт цены иностранных бумаг и часть платежей
-    (дивиденды, пополнения в валюте) в валюте инструмента, а в таблице всё
-    складывается в рублях. Справочник валют загружается лениво — только
-    если в портфеле реально встретилась не-рублёвая валюта. Для чисто
-    рублёвого портфеля лишних запросов к API нет.
+    Зачем два вида курса:
+      • Текущие позиции оцениваются по СЕГОДНЯШНЕМУ курсу — это их стоимость сейчас.
+      • Операции (пополнения, выводы, дивиденды) — по курсу НА ДАТУ операции,
+        как в приложении Т-Инвестиций. Иначе доллары, внесённые в 2021 году
+        по 72 ₽, считались бы по сегодняшним 85 ₽ и искажали «Вложено».
+
+    Всё загружается лениво: для чисто рублёвого портфеля запросов к API нет.
+    Справочник берётся со статусом ALL — иначе не находятся валюты, которые
+    сейчас не торгуются на бирже (например, EUR с 2024 года).
     """
 
-    def __init__(self, client):
-        self.client = client
-        self.rates = {'rub': 1.0}
-        self._missing = set()
+    # Если последняя свеча старше операции больше чем на столько дней —
+    # торгов не было (инструмент остановлен), берём текущий курс.
+    MAX_GAP_DAYS = 10
 
+    def __init__(self, client, history_from=None):
+        self.client = client
+        self.rates = {'rub': 1.0}          # текущие курсы
+        self.history_from = history_from   # с какой даты грузить историю
+        self._history = {}                 # валюта -> (список дат, список курсов)
+        self._missing = set()
+        self._instruments = None
+
+    # --- текущий курс ------------------------------------------------------
     def get(self, currency):
         cur = (currency or 'rub').lower()
         if cur in self.rates:
             return self.rates[cur]
         if cur in self._missing:
             return 1.0
-        rate = self._load(cur)
+        rate = self._load_current(cur)
         if rate is None:
             self._missing.add(cur)
             # ::warning:: — видно в интерфейсе GitHub Actions, но не роняет запуск
@@ -217,29 +230,87 @@ class CurrencyRates:
         self.rates[cur] = rate
         return rate
 
-    def _load(self, cur):
+    # --- курс на дату --------------------------------------------------------
+    def at(self, currency, dt):
+        """Курс на дату dt: закрытие торгового дня dt или ближайшего до него."""
+        cur = (currency or 'rub').lower()
+        if cur == 'rub' or dt is None:
+            return self.get(cur)
+        if cur not in self._history:
+            self._history[cur] = self._load_history(cur)
+        hist = self._history[cur]
+        if not hist:
+            return self.get(cur)
+        dates, closes = hist
+        day = dt.date()
+        i = bisect.bisect_right(dates, day) - 1
+        if i < 0:
+            return closes[0]  # операция раньше первой свечи — берём самый ранний курс
+        if (day - dates[i]).days > self.MAX_GAP_DAYS:
+            return self.get(cur)
+        return closes[i]
+
+    # --- загрузка ------------------------------------------------------------
+    def _instrument(self, cur):
+        if self._instruments is None:
+            self._instruments = self.client.instruments.currencies(
+                instrument_status=InstrumentStatus.INSTRUMENT_STATUS_ALL,
+            ).instruments
+        candidates = [
+            c for c in self._instruments
+            if str(getattr(c, 'iso_currency_name', '') or '').lower() == cur
+        ]
+        if not candidates:
+            return None
+        # Предпочитаем расчёты «завтра» (TOM) — это основной биржевой курс
+        candidates.sort(key=lambda c: 'TOM' not in (c.ticker or '').upper())
+        return candidates[0]
+
+    @staticmethod
+    def _nominal(inst):
+        # Некоторые валюты котируются за 100 единиц (например, JPY)
+        nominal = float(quotation_to_decimal(inst.nominal)) if getattr(inst, 'nominal', None) else 0.0
+        return nominal if nominal > 0 else 1.0
+
+    def _load_current(self, cur):
         try:
-            instruments = self.client.instruments.currencies().instruments
-            candidates = [
-                c for c in instruments
-                if str(getattr(c, 'iso_currency_name', '') or '').lower() == cur
-            ]
-            if not candidates:
+            inst = self._instrument(cur)
+            if inst is None:
                 return None
-            # Предпочитаем расчёты «завтра» (TOM) — это основной биржевой курс
-            candidates.sort(key=lambda c: 'TOM' not in (c.ticker or '').upper())
-            inst = candidates[0]
             prices = self.client.market_data.get_last_prices(figi=[inst.figi]).last_prices
-            if not prices:
-                return None
-            price = float(quotation_to_decimal(prices[0].price))
-            # Некоторые валюты котируются за 100 единиц (например, JPY)
-            nominal = float(quotation_to_decimal(inst.nominal)) if getattr(inst, 'nominal', None) else 0.0
-            if nominal > 0:
-                price /= nominal
-            return price if price > 0 else None
+            price = float(quotation_to_decimal(prices[0].price)) if prices else 0.0
+            if price <= 0:
+                # Инструмент не торгуется — берём последнюю известную свечу
+                hist = self._history.get(cur) or self._load_history(cur)
+                self._history[cur] = hist
+                return hist[1][-1] if hist else None
+            return price / self._nominal(inst)
         except Exception as e:
             print(f"  ! Ошибка получения курса {cur.upper()}: {e}")
+            return None
+
+    def _load_history(self, cur):
+        try:
+            inst = self._instrument(cur)
+            if inst is None:
+                return None
+            start = self.history_from or (datetime.now(timezone.utc) - timedelta(days=OPERATIONS_DAYS))
+            nominal = self._nominal(inst)
+            points = {}
+            for c in self.client.get_all_candles(
+                figi=inst.figi, from_=start - timedelta(days=15),
+                interval=CandleInterval.CANDLE_INTERVAL_DAY,
+            ):
+                close = float(quotation_to_decimal(c.close))
+                if close > 0:
+                    points[c.time.date()] = close / nominal
+            if not points:
+                print(f"::warning::Нет истории курса {cur.upper()} — операции пересчитаны по текущему курсу")
+                return None
+            dates = sorted(points)
+            return dates, [points[d] for d in dates]
+        except Exception as e:
+            print(f"::warning::Ошибка загрузки истории курса {cur.upper()}: {e} — используется текущий курс")
             return None
 
 
@@ -396,6 +467,7 @@ def collect_positions(client, accounts, rates, instr_cache):
     ]
     raw_data = [header]
     skipped_money_dupes = 0
+    open_yield_rub = 0.0
 
     for idx, account in enumerate(accounts, start=1):
         account_id = account.id
@@ -445,6 +517,15 @@ def collect_positions(client, accounts, rates, instr_cache):
             position_rub = (current_price + nkd_per_unit) * qty_pcs
             current_price_with_nkd = current_price + nkd_per_unit
 
+            # Доход по открытой позиции за всё время — ровно та цифра, что
+            # в приложении «Открытые позиции → За всё время» (API считает сам)
+            ey = getattr(position, 'expected_yield', None)
+            if ey:
+                open_yield_rub += (
+                    float(quotation_to_decimal(ey))
+                    * rates.get(_money_currency(position.current_price))
+                )
+
             raw_data.append([
                 account_id, info['instrument_type'], figi, ticker, info['name'],
                 lot, qty_lots, qty_pcs,
@@ -473,7 +554,7 @@ def collect_positions(client, accounts, rates, instr_cache):
     if skipped_money_dupes:
         print(f"  ℹ️ Пропущено денежных дубликатов (RUB000UTSTOM): {skipped_money_dupes}")
 
-    return raw_data
+    return raw_data, open_yield_rub
 
 
 # ----------------------------------------------------------------------------
@@ -526,12 +607,21 @@ def _account_start(account, fallback_from):
     return fallback_from
 
 
-def build_operations_data(client, accounts, from_date, to_date, instr_cache):
-    header = [
-        'date', 'accountId', 'type', 'ticker', 'name',
-        'quantity', 'price_rub', 'payment_rub', 'currency',
-        'figi', 'operation_id',
-    ]
+OPERATIONS_HEADER = [
+    'date', 'accountId', 'type', 'ticker', 'name',
+    'quantity', 'price_rub', 'payment_rub', 'currency',
+    'figi', 'operation_id', 'payment_original',
+]
+
+
+def build_operations_data(client, accounts, from_date, to_date, instr_cache, rates):
+    """Операции по всем счетам.
+
+    price_rub и payment_rub — в рублях по курсу НА ДАТУ операции (как в
+    приложении). payment_original — исходная сумма в валюте операции
+    (для рублёвых совпадает с payment_rub).
+    """
+    header = OPERATIONS_HEADER[:]
     rows = [header]
     type_counter = Counter()
     for idx, account in enumerate(accounts, start=1):
@@ -555,13 +645,20 @@ def build_operations_data(client, accounts, from_date, to_date, instr_cache):
             op_type_str = str(getattr(op_type, 'name', op_type) or '')
             type_counter[op_type_str] += 1
             quantity = float(getattr(op, 'quantity', 0) or 0)
-            price = float(quotation_to_decimal(getattr(op, 'price', None))) if getattr(op, 'price', None) else 0.0
-            payment = float(quotation_to_decimal(getattr(op, 'payment', None))) if getattr(op, 'payment', None) else 0.0
+            price_mv = getattr(op, 'price', None)
+            payment_mv = getattr(op, 'payment', None)
+            price = float(quotation_to_decimal(price_mv)) if price_mv else 0.0
+            payment = float(quotation_to_decimal(payment_mv)) if payment_mv else 0.0
             currency = str(getattr(op, 'currency', '') or '').upper()
+            # Валюта самой суммы: у MoneyValue она своя, запасной вариант — валюта операции
+            pay_cur = _money_currency(payment_mv) if payment_mv else currency.lower()
+            price_cur = _money_currency(price_mv) if price_mv else currency.lower()
+            payment_rub = payment * rates.at(pay_cur, dt) if payment else 0.0
+            price_rub = price * rates.at(price_cur, dt) if price else 0.0
             op_id = str(getattr(op, 'id', '') or '')
             rows.append([
                 date_str, account_id, op_type_str, ticker, name,
-                quantity, price, payment, currency, figi, op_id,
+                quantity, price_rub, payment_rub, currency, figi, op_id, payment,
             ])
         time.sleep(0.5)
     if len(rows) > 1:
@@ -609,7 +706,7 @@ def _pct(x, base):
     return round(x / base * 100, 2)
 
 
-def build_report(operations_rows, raw_positions, snapshot_ref, today=None, rates=None):
+def build_report(operations_rows, raw_positions, snapshot_ref, today=None, open_yield=None):
     """Формирует лист Report — человекочитаемую панель.
 
     Логика:
@@ -617,23 +714,22 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None, rates
       Результат (руб)  = Портфель сейчас − Вложено (нетто)
       Структура результата:
           Дивиденды + Купоны + Комиссии + Налоги + Изменение цены
+          Изменение цены = Открытые позиции (как в приложении) + Проданные бумаги
       Простая доходность = Результат / Вложено (нетто) * 100
       Годовая (XIRR)     = по всем потокам капитала (input/output/final)
+
+    open_yield — доход по открытым позициям из API (expected_yield). Если None,
+    изменение цены выводится одной строкой.
     """
     if today is None:
         today = datetime.now(timezone.utc).replace(tzinfo=None)
 
     H_ops = {k: i for i, k in enumerate(operations_rows[0])}
     H_pos = {k: i for i, k in enumerate(raw_positions[0])}
-    rates = rates or {'rub': 1.0}
 
     def _payment_rub(r):
-        """Сумма операции в рублях. Платежи в валюте (дивиденды, пополнения
-        в USD и т.п.) пересчитываются по текущему курсу — это приближение,
-        но без него доллары складывались с рублями один к одному."""
-        payment = float(r[H_ops['payment_rub']] or 0)
-        cur = str(r[H_ops['currency']] or 'rub').lower()
-        return payment * rates.get(cur, 1.0)
+        # payment_rub уже пересчитан в рубли по курсу на дату операции
+        return float(r[H_ops['payment_rub']] or 0)
 
     # --- Портфель сейчас ---
     portfolio_value = 0.0
@@ -801,7 +897,17 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None, rates
     rows.append(['  ├ Купоны', _fmt_money(total_coupons), _pct_of_invested(total_coupons)])
     rows.append(['  ├ Комиссии', _fmt_money(total_fees), _pct_of_invested(total_fees)])
     rows.append(['  ├ Налоги', _fmt_money(total_taxes), _pct_of_invested(total_taxes)])
-    rows.append(['  └ Изменение цены', _fmt_money(price_change), _pct_of_invested(price_change)])
+    if open_yield is None:
+        rows.append(['  └ Изменение цены', _fmt_money(price_change), _pct_of_invested(price_change)])
+    else:
+        # Делим на две части, чтобы первая строка совпадала с приложением
+        # («Открытые позиции → За всё время»), а вторая показывала то,
+        # чего в приложении в этой строке нет — результат по уже проданным бумагам.
+        sold_result = price_change - open_yield
+        rows.append(['  ├ Изменение цены (открытые позиции)', _fmt_money(open_yield),
+                     _pct_of_invested(open_yield)])
+        rows.append(['  └ Результат по проданным бумагам', _fmt_money(sold_result),
+                     _pct_of_invested(sold_result)])
     rows.append(['', '', ''])
 
     # --- Доходность за всё время ---
@@ -838,7 +944,7 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None, rates
 # ----------------------------------------------------------------------------
 # Сборка всех листов
 # ----------------------------------------------------------------------------
-def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref, rates=None):
+def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref, open_yield=None):
     header = raw_data[0]
     H = {k: i for i, k in enumerate(header)}
     sheets = {}
@@ -872,7 +978,8 @@ def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref, rat
     sheets[SUMMARY_BY_TYPE_SHEET] = summary
 
     sheets[OPERATIONS_SHEET] = operations_data
-    sheets[REPORT_SHEET] = build_report(operations_data, raw_data, snapshot_ref, rates=rates)
+    sheets[REPORT_SHEET] = build_report(operations_data, raw_data, snapshot_ref,
+                                        open_yield=open_yield)
     sheets[SNAPSHOTS_SHEET] = snapshot_data
 
     return sheets
@@ -893,29 +1000,25 @@ def main():
         ]
         print(f"Открытых счетов: {len(accounts)}")
 
-        rates = CurrencyRates(client)
+        to_date = datetime.now(timezone.utc)
+        from_date = to_date - timedelta(days=OPERATIONS_DAYS)
+        # История курсов нужна с самой ранней даты, за которую грузим операции
+        history_from = min((_account_start(a, from_date) for a in accounts), default=from_date)
+        rates = CurrencyRates(client, history_from=history_from)
         instr_cache = {}  # общий справочник FIGI → инструмент для позиций и операций
 
         print("\nСбор позиций...")
-        raw_data = collect_positions(client, accounts, rates, instr_cache)
+        raw_data, open_yield = collect_positions(client, accounts, rates, instr_cache)
         print(f"Собрано строк: {len(raw_data) - 1}")
+        print(f"Доход по открытым позициям: {open_yield:,.2f} ₽")
 
-        operations_data = [['date', 'accountId', 'type', 'ticker', 'name',
-                            'quantity', 'price_rub', 'payment_rub', 'currency',
-                            'figi', 'operation_id']]
+        operations_data = [OPERATIONS_HEADER[:]]
         if OPERATIONS_DAYS > 0:
-            to_date = datetime.now(timezone.utc)
-            from_date = to_date - timedelta(days=OPERATIONS_DAYS)
             print(f"\nСбор операций до {to_date.date()} (с даты открытия каждого счёта)")
             operations_data = build_operations_data(
-                client, accounts, from_date, to_date, instr_cache,
+                client, accounts, from_date, to_date, instr_cache, rates,
             )
             print(f"\nСобрано операций: {len(operations_data) - 1}")
-
-            # Курсы для валют, встретившихся в операциях, — пока клиент открыт
-            cur_idx = operations_data[0].index('currency')
-            for r in operations_data[1:]:
-                rates.get(r[cur_idx])
 
     client_api = AppsScriptClient(APPS_SCRIPT_URL, SECRET)
 
@@ -939,7 +1042,7 @@ def main():
 
     print("\nПодготовка листов...")
     sheets = build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref,
-                              rates=rates.rates)
+                              open_yield=open_yield)
 
     print("Отправка в Google Sheets через Apps Script...")
     client_api.write_tables(sheets)
