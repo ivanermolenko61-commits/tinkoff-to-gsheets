@@ -7,6 +7,11 @@ on:
 
   # Возможность запустить вручную из интерфейса GitHub
   workflow_dispatch:
+    inputs:
+      test_notify:
+        description: 'Отправить тестовое сообщение в Telegram (проверка секретов)'
+        type: boolean
+        default: false
 
 # Не запускать два синка одновременно: иначе они могут перезаписывать листы
 # друг другу и задвоить строку снимка за день. Новый запуск ждёт старый.
@@ -17,6 +22,10 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # actions: read — чтобы notify.sh мог посмотреть итоги прошлых запусков
+    permissions:
+      contents: read
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -49,3 +58,16 @@ jobs:
           APPS_SCRIPT_URL:    ${{ secrets.APPS_SCRIPT_URL }}
           APPS_SCRIPT_SECRET: ${{ secrets.APPS_SCRIPT_SECRET }}
         run: python invest.py
+
+      # Выполняется всегда (и при ошибке выше). Пишет в Telegram только при
+      # смене состояния: сломался (2 провала подряд) / починился. См. notify.sh.
+      # Секреты TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID добавить в Settings → Secrets;
+      # пока их нет, шаг просто пропускается.
+      - name: Notify Telegram
+        if: always()
+        env:
+          TG_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN:    ${{ github.token }}
+          TEST_NOTIFY: ${{ inputs.test_notify }}
+        run: bash .github/scripts/notify.sh "${{ job.status }}"
