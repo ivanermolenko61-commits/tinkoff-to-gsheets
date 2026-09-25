@@ -7,7 +7,7 @@
  */
 
 const SECRET = PropertiesService.getScriptProperties().getProperty('APPS_SECRET') || '';
-const SCRIPT_VERSION = 'v5-2026-09-20';
+const SCRIPT_VERSION = 'v6-2026-09-25';
 
 // ---------------------------------------------------------------------------
 // POST — запись листов
@@ -57,15 +57,9 @@ function doPost(e) {
     }
 
     var received = data.secret === null || data.secret === undefined ? '' : String(data.secret);
-    if (received.trim() !== String(SECRET).trim()) {
-      return jsonResponse_({
-        status: 'error',
-        message: 'Invalid secret',
-        debug: Object.assign(debugInfo, {
-          receivedSecretLength: received.length,
-          expectedSecretLength: String(SECRET).length,
-        }),
-      });
+    // Длины секретов в ответ больше не отдаём — это подсказка для подбора
+    if (!isSecretValid_(received)) {
+      return jsonResponse_({ status: 'error', message: 'Invalid secret' });
     }
 
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -145,7 +139,7 @@ function doPost(e) {
 function doGet(e) {
   try {
     var secret = (e && e.parameter && e.parameter.secret) || '';
-    if (String(secret).trim() !== String(SECRET).trim()) {
+    if (!isSecretValid_(secret)) {
       return jsonResponse_({ status: 'error', message: 'Invalid secret' });
     }
     var action = ((e.parameter.action || '') + '').trim();
@@ -335,6 +329,19 @@ function appendOrUpdateSnapshots_(ss, rows, result) {
 // ---------------------------------------------------------------------------
 // Хелперы
 // ---------------------------------------------------------------------------
+
+/**
+ * Проверка секрета. Если свойство APPS_SECRET не задано (например, скрипт
+ * скопировали без свойств), раньше SECRET был '' и запрос без секрета
+ * проходил проверку — любой мог писать в таблицу. Теперь пустой секрет
+ * на стороне скрипта = отказ всем.
+ */
+function isSecretValid_(received) {
+  var expected = String(SECRET).trim();
+  if (!expected) return false;
+  return String(received).trim() === expected;
+}
+
 function normalizeDate_(v) {
   if (v === null || v === undefined || v === '') return '';
   if (v instanceof Date) {

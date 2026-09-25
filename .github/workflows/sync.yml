@@ -8,6 +8,12 @@ on:
   # Возможность запустить вручную из интерфейса GitHub
   workflow_dispatch:
 
+# Не запускать два синка одновременно: иначе они могут перезаписывать листы
+# друг другу и задвоить строку снимка за день. Новый запуск ждёт старый.
+concurrency:
+  group: tinkoff-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest

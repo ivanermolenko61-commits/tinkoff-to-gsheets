@@ -44,7 +44,10 @@ if not APPS_SCRIPT_URL:
 if not SECRET:
     raise SystemExit("Не задан APPS_SCRIPT_SECRET (проверьте .env или переменные окружения)")
 
+# Операции грузятся с даты открытия счёта (чтобы «за всё время» было правдой).
+# OPERATIONS_DAYS — запасной вариант, если API не вернул дату открытия.
 OPERATIONS_DAYS = 1095
+OPERATIONS_RETRIES = 3
 REPORT_WINDOW_DAYS = 365
 SNAPSHOT_DAYS_AGO = 365
 SNAPSHOT_MIN_DAYS_AGO = 2
@@ -177,6 +180,67 @@ def _status_to_str(v):
     if v is None: return ''
     name = getattr(v, 'name', None)
     return str(name).upper() if name else str(v).upper()
+
+
+def _money_currency(v):
+    """Валюта MoneyValue в нижнем регистре ('rub', 'usd', ...)."""
+    return str(getattr(v, 'currency', '') or 'rub').lower()
+
+
+class CurrencyRates:
+    """Курсы валют к рублю по последней цене биржевых инструментов.
+
+    Нужны, потому что API отдаёт цены иностранных бумаг и часть платежей
+    (дивиденды, пополнения в валюте) в валюте инструмента, а в таблице всё
+    складывается в рублях. Справочник валют загружается лениво — только
+    если в портфеле реально встретилась не-рублёвая валюта. Для чисто
+    рублёвого портфеля лишних запросов к API нет.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self.rates = {'rub': 1.0}
+        self._missing = set()
+
+    def get(self, currency):
+        cur = (currency or 'rub').lower()
+        if cur in self.rates:
+            return self.rates[cur]
+        if cur in self._missing:
+            return 1.0
+        rate = self._load(cur)
+        if rate is None:
+            self._missing.add(cur)
+            # ::warning:: — видно в интерфейсе GitHub Actions, но не роняет запуск
+            print(f"::warning::Не найден курс {cur.upper()} к рублю — суммы в этой валюте не пересчитаны")
+            return 1.0
+        self.rates[cur] = rate
+        return rate
+
+    def _load(self, cur):
+        try:
+            instruments = self.client.instruments.currencies().instruments
+            candidates = [
+                c for c in instruments
+                if str(getattr(c, 'iso_currency_name', '') or '').lower() == cur
+            ]
+            if not candidates:
+                return None
+            # Предпочитаем расчёты «завтра» (TOM) — это основной биржевой курс
+            candidates.sort(key=lambda c: 'TOM' not in (c.ticker or '').upper())
+            inst = candidates[0]
+            prices = self.client.market_data.get_last_prices(figi=[inst.figi]).last_prices
+            if not prices:
+                return None
+            price = float(quotation_to_decimal(prices[0].price))
+            # Некоторые валюты котируются за 100 единиц (например, JPY)
+            nominal = float(quotation_to_decimal(inst.nominal)) if getattr(inst, 'nominal', None) else 0.0
+            if nominal > 0:
+                price /= nominal
+            return price if price > 0 else None
+        except Exception as e:
+            print(f"  ! Ошибка получения курса {cur.upper()}: {e}")
+            return None
 
 
 def get_instrument_info(client, figi):
@@ -323,7 +387,7 @@ def aggregate_by_key(rows, key_name):
 # ----------------------------------------------------------------------------
 # Сбор позиций (без изменений)
 # ----------------------------------------------------------------------------
-def collect_positions(client, accounts):
+def collect_positions(client, accounts, rates, instr_cache):
     header = [
         'accountId', 'type', 'figi', 'ticker', 'name', 'lot',
         'quantity_lots', 'quantity_pcs', 'current_price_rub_per_piece',
@@ -343,7 +407,9 @@ def collect_positions(client, accounts):
             figi = position.figi
             if not figi:
                 continue
-            info = get_instrument_info(client, figi)
+            if figi not in instr_cache:
+                instr_cache[figi] = get_instrument_info(client, figi) or {}
+            info = instr_cache[figi]
             if not info:
                 continue
 
@@ -354,16 +420,25 @@ def collect_positions(client, accounts):
 
             lot = max(1, int(info['lot']))
             qty_pcs = float(quotation_to_decimal(position.quantity))
-            current_price = float(quotation_to_decimal(position.current_price))
+            # Цены приходят в валюте инструмента (у иностранных бумаг — USD и т.п.),
+            # переводим в рубли. Для рублёвых бумаг курс = 1, ничего не меняется.
+            current_price = (
+                float(quotation_to_decimal(position.current_price))
+                * rates.get(_money_currency(position.current_price))
+            )
             avg_price = (
                 float(quotation_to_decimal(position.average_position_price))
+                * rates.get(_money_currency(position.average_position_price))
                 if position.average_position_price else 0
             )
 
             nkd_per_unit = 0.0
             nkd_field = getattr(position, 'current_nkd', None)
             if nkd_field:
-                nkd_per_unit = float(quotation_to_decimal(nkd_field))
+                nkd_per_unit = (
+                    float(quotation_to_decimal(nkd_field))
+                    * rates.get(_money_currency(nkd_field))
+                )
 
             qty_lots = qty_pcs / lot if lot else qty_pcs
             price_per_lot = current_price * lot
@@ -384,7 +459,9 @@ def collect_positions(client, accounts):
             cur = str(getattr(money, 'currency', '') or '').upper()
             if cur == 'RUB':
                 rub_amount = float(quotation_to_decimal(money))
-                if rub_amount > 0:
+                # != 0, а не > 0: отрицательный баланс (маржинальный долг)
+                # тоже должен уменьшать стоимость портфеля
+                if rub_amount != 0:
                     raw_data.append([
                         account_id, 'money', '', 'RUB', 'Деньги (RUB)',
                         '', '', '', '', '', '', rub_amount, 'RUB',
@@ -403,12 +480,27 @@ def collect_positions(client, accounts):
 # Сбор операций (без изменений)
 # ----------------------------------------------------------------------------
 def fetch_operations_chunk(client, account_id, from_dt, to_dt):
-    try:
-        resp = client.operations.get_operations(account_id=account_id, from_=from_dt, to=to_dt)
-        return list(resp.operations or [])
-    except Exception as e:
-        print(f"      ! Ошибка {from_dt.date()}..{to_dt.date()}: {e}")
-        return []
+    """Операции за период с повторами при сбое.
+
+    Если после всех попыток API так и не ответил — бросаем исключение, и запуск
+    падает. Раньше ошибка превращалась в пустой список: из отчёта молча
+    пропадали пополнения за период, и в таблицу писалась неверная доходность.
+    Лучше красный запуск и вчерашние данные, чем зелёный с неправдой.
+    """
+    last_error = None
+    for attempt in range(1, OPERATIONS_RETRIES + 1):
+        try:
+            resp = client.operations.get_operations(account_id=account_id, from_=from_dt, to=to_dt)
+            return list(resp.operations or [])
+        except Exception as e:
+            last_error = e
+            print(f"      ! Ошибка {from_dt.date()}..{to_dt.date()} "
+                  f"(попытка {attempt}/{OPERATIONS_RETRIES}): {e}")
+            if attempt < OPERATIONS_RETRIES:
+                time.sleep(2 * attempt)
+    raise RuntimeError(
+        f"Не удалось получить операции за {from_dt.date()}..{to_dt.date()}: {last_error}"
+    ) from last_error
 
 
 def fetch_operations_for_account(client, account_id, from_date, to_date):
@@ -421,19 +513,32 @@ def fetch_operations_for_account(client, account_id, from_date, to_date):
     return all_ops
 
 
-def build_operations_data(client, accounts, from_date, to_date):
+def _account_start(account, fallback_from):
+    """С какой даты грузить операции по счёту: с его открытия.
+
+    Если API не вернул дату (или вернул «пустую» 1970 года) — берём fallback.
+    """
+    opened = getattr(account, 'opened_date', None)
+    if opened and opened.year >= 2000:
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        return min(opened, fallback_from)
+    return fallback_from
+
+
+def build_operations_data(client, accounts, from_date, to_date, instr_cache):
     header = [
         'date', 'accountId', 'type', 'ticker', 'name',
         'quantity', 'price_rub', 'payment_rub', 'currency',
         'figi', 'operation_id',
     ]
     rows = [header]
-    instr_cache = {}
     type_counter = Counter()
     for idx, account in enumerate(accounts, start=1):
         account_id = account.id
-        print(f"  · Операции по счёту #{idx} ({account_id})...")
-        ops = fetch_operations_for_account(client, account_id, from_date, to_date)
+        acc_from = _account_start(account, from_date)
+        print(f"  · Операции по счёту #{idx} ({account_id}) с {acc_from.date()}...")
+        ops = fetch_operations_for_account(client, account_id, acc_from, to_date)
         print(f"    найдено операций: {len(ops)}")
         for op in ops:
             figi = getattr(op, 'figi', '') or ''
@@ -504,7 +609,7 @@ def _pct(x, base):
     return round(x / base * 100, 2)
 
 
-def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
+def build_report(operations_rows, raw_positions, snapshot_ref, today=None, rates=None):
     """Формирует лист Report — человекочитаемую панель.
 
     Логика:
@@ -520,6 +625,15 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
 
     H_ops = {k: i for i, k in enumerate(operations_rows[0])}
     H_pos = {k: i for i, k in enumerate(raw_positions[0])}
+    rates = rates or {'rub': 1.0}
+
+    def _payment_rub(r):
+        """Сумма операции в рублях. Платежи в валюте (дивиденды, пополнения
+        в USD и т.п.) пересчитываются по текущему курсу — это приближение,
+        но без него доллары складывались с рублями один к одному."""
+        payment = float(r[H_ops['payment_rub']] or 0)
+        cur = str(r[H_ops['currency']] or 'rub').lower()
+        return payment * rates.get(cur, 1.0)
 
     # --- Портфель сейчас ---
     portfolio_value = 0.0
@@ -548,7 +662,7 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
         op_type = str(r[H_ops['type']] or '')
         category = categorize_operation(op_type)
         try:
-            payment = float(r[H_ops['payment_rub']] or 0)
+            payment = _payment_rub(r)
         except (ValueError, TypeError):
             payment = 0.0
         dt = _parse_datetime(r[H_ops['date']])
@@ -607,11 +721,15 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
                 op_type = str(r[H_ops['type']] or '')
                 category = categorize_operation(op_type)
                 try:
-                    payment = float(r[H_ops['payment_rub']] or 0)
+                    payment = _payment_rub(r)
                 except (ValueError, TypeError):
                     payment = 0.0
                 dt = _parse_datetime(r[H_ops['date']])
-                if dt is None or dt < start_dt:
+                # Снимок за день D перезаписывается каждые 15 минут, т.е. в нём
+                # стоимость на конец дня D, и операции дня D в неё уже вошли.
+                # Поэтому берём только операции ПОСЛЕ дня снимка — иначе
+                # пополнение в день снимка учитывалось дважды.
+                if dt is None or dt.date() <= start_dt.date():
                     continue
                 if category == 'input' and payment > 0:
                     period_inputs += payment
@@ -626,11 +744,15 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
                 op_type = str(r[H_ops['type']] or '')
                 category = categorize_operation(op_type)
                 try:
-                    payment = float(r[H_ops['payment_rub']] or 0)
+                    payment = _payment_rub(r)
                 except (ValueError, TypeError):
                     payment = 0.0
                 dt = _parse_datetime(r[H_ops['date']])
-                if dt is None or dt < start_dt:
+                # Снимок за день D перезаписывается каждые 15 минут, т.е. в нём
+                # стоимость на конец дня D, и операции дня D в неё уже вошли.
+                # Поэтому берём только операции ПОСЛЕ дня снимка — иначе
+                # пополнение в день снимка учитывалось дважды.
+                if dt is None or dt.date() <= start_dt.date():
                     continue
                 if category == 'input' and payment > 0:
                     period_flows.append((dt, -payment))
@@ -716,7 +838,7 @@ def build_report(operations_rows, raw_positions, snapshot_ref, today=None):
 # ----------------------------------------------------------------------------
 # Сборка всех листов
 # ----------------------------------------------------------------------------
-def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref):
+def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref, rates=None):
     header = raw_data[0]
     H = {k: i for i, k in enumerate(header)}
     sheets = {}
@@ -745,12 +867,12 @@ def build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref):
         if cat in sums:
             summary.append([cat, sums[cat]])
     money_sum = sum(float(r[H['position_value_rub']] or 0) for r in per_type['Money'][1:])
-    if money_sum > 0:
+    if money_sum != 0:
         summary.append(['Money', money_sum])
     sheets[SUMMARY_BY_TYPE_SHEET] = summary
 
     sheets[OPERATIONS_SHEET] = operations_data
-    sheets[REPORT_SHEET] = build_report(operations_data, raw_data, snapshot_ref)
+    sheets[REPORT_SHEET] = build_report(operations_data, raw_data, snapshot_ref, rates=rates)
     sheets[SNAPSHOTS_SHEET] = snapshot_data
 
     return sheets
@@ -771,8 +893,11 @@ def main():
         ]
         print(f"Открытых счетов: {len(accounts)}")
 
+        rates = CurrencyRates(client)
+        instr_cache = {}  # общий справочник FIGI → инструмент для позиций и операций
+
         print("\nСбор позиций...")
-        raw_data = collect_positions(client, accounts)
+        raw_data = collect_positions(client, accounts, rates, instr_cache)
         print(f"Собрано строк: {len(raw_data) - 1}")
 
         operations_data = [['date', 'accountId', 'type', 'ticker', 'name',
@@ -781,9 +906,16 @@ def main():
         if OPERATIONS_DAYS > 0:
             to_date = datetime.now(timezone.utc)
             from_date = to_date - timedelta(days=OPERATIONS_DAYS)
-            print(f"\nСбор операций за период {from_date.date()} .. {to_date.date()}")
-            operations_data = build_operations_data(client, accounts, from_date, to_date)
+            print(f"\nСбор операций до {to_date.date()} (с даты открытия каждого счёта)")
+            operations_data = build_operations_data(
+                client, accounts, from_date, to_date, instr_cache,
+            )
             print(f"\nСобрано операций: {len(operations_data) - 1}")
+
+            # Курсы для валют, встретившихся в операциях, — пока клиент открыт
+            cur_idx = operations_data[0].index('currency')
+            for r in operations_data[1:]:
+                rates.get(r[cur_idx])
 
     client_api = AppsScriptClient(APPS_SCRIPT_URL, SECRET)
 
@@ -806,7 +938,8 @@ def main():
     print(f"\nСегодняшний снимок: {snapshot_data[1][0]} — {snapshot_data[1][1]:,.2f} ₽")
 
     print("\nПодготовка листов...")
-    sheets = build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref)
+    sheets = build_all_sheets(raw_data, operations_data, snapshot_data, snapshot_ref,
+                              rates=rates.rates)
 
     print("Отправка в Google Sheets через Apps Script...")
     client_api.write_tables(sheets)
