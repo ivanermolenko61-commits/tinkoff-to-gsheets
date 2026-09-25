@@ -1,0 +1,2 @@
+# Shell-скрипты выполняются на Linux-раннерах GitHub — только LF
+*.sh text eol=lf
