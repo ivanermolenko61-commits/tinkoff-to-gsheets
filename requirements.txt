@@ -1,4 +1,5 @@
---extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
-t-tech-investments>=1.49.3
+# SDK mirror announced by T-Invest API: https://www.tbank.ru/invest/social/profile/T_InvestAPI/
+# Pin the source commit and wheel checksum; opensource.tbank.ru is unavailable.
+t-tech-investments @ https://raw.githubusercontent.com/Invest-SDK/invest-python/79c1eec76a691c15b55e825a8e4d1a94abe75f67/t_tech_investments-1.51.0-py3-none-any.whl#sha256=74b7a95474a238a982863740a2299145fd0a2d5d1f6e9cb09b717d6f87dd1d4b
 requests>=2.34.0
 python-dotenv>=1.0.1
